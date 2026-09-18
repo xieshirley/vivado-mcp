@@ -1,7 +1,7 @@
 """GuiSession：连接到 Vivado GUI 的 TCP 会话。
 
 两种启动方式：
-1. ``attach_only=False`` （默认）—— MCP自己 spawn ``vivado -mode gui``，
+1. ``attach_only=False`` （默认）—— MCP 自己 spawn ``vivado -mode gui``，
    GUI 启动时 source 注入脚本开启 TCP server，然后 MCP 连上。用户**会看到 Vivado 图标**。
 2. ``attach_only=True`` —— 假设用户已手动打开 Vivado（需先 ``vivado-mcp install``
    让 init.tcl 自动开 server），MCP 直接 TCP 连。
@@ -9,17 +9,6 @@
 协议：length-prefix framing（4 字节 big-endian + UTF-8 payload）
 - 请求 payload = Tcl 命令文本
 - 响应 payload = JSON: ``{"rc": int, "output": string}``
-
-Patches applied (see PATCH_NOTES.md for details):
-- P0 (stderr): ``stderr`` 改 PIPE + 新增 ``_drain_stderr`` 后台任务，失败时通过 ``_recent_stderr``
-  把 stderr 最近 N 行附加到 RuntimeError 异常。原本 ``stderr=DEVNULL`` 把所有
-  启动失败信息吞了。
-- P1 (loader.bat)：launcher 不再只 spawn ``vivado.bat``，而是先经过 ``cmd.exe /c``
-  启动，确保 cmd 解释器能传递环境变量；同时修了上游 issue #6 中
-  ``PROCESSOR_ARCHITECTURE`` 注入无效的已知问题（详见 PATCH_NOTES.md）。
-- P2 (stdout)：``stdout`` 同样改 PIPE + 新增 ``_drain_stdout`` 任务，失败时通过
-  ``_recent_stdout`` 把 stdout 最近 N 行附加到异常。Vivado loader.bat 的
-  "Could not find 32-bit executable" 等诊断走 stdout，没有 PIPE 会完全黑盒。
 """
 
 from __future__ import annotations
@@ -36,7 +25,7 @@ import time
 import uuid
 from pathlib import Path
 
-from vivado_mcp.tcl_script import QUERY_CURRENT_PROJECT
+from vivado_mcp.tcl_scripts import QUERY_CURRENT_PROJECT
 from vivado_mcp.vivado.base_session import BaseSession, SessionState
 from vivado_mcp.vivado.tcl_utils import TclResult, clean_output, decode_vivado_output
 
@@ -89,7 +78,7 @@ def _verify_probe_resp(obj: object, token: str) -> bool:
 
 
 def _recv_exact(sock: socket.socket, n: int) -> bytes | None:
-    """同步阻塞收满 n 字节，失败返回 None。"""
+    """同步阻塞收满 n 字节,失败返回 None。"""
     buf = bytearray()
     while len(buf) < n:
         try:
@@ -141,9 +130,7 @@ def probe_vmcp_server(host: str, port: int, timeout: float = 0.5) -> bool:
 
 
 def _query_current_project(
-    host: str,
-    port: int,
-    timeout: float = _CURPROJ_TIMEOUT,
+    host: str, port: int, timeout: float = _CURPROJ_TIMEOUT
 ) -> str | None:
     """一次性独立短连接查询 current_project(PRD A2 横幅提示用)。
 
@@ -166,8 +153,7 @@ def _query_current_project(
             if hdr is None:
                 logger.warning(
                     "current_project 查询读响应头失败(对端关闭或 %ss 超时),"
-                    "banner 省略项目提示",
-                    timeout,
+                    "banner 省略项目提示", timeout,
                 )
                 return None
             resp_len = int.from_bytes(hdr, "big")
@@ -181,8 +167,7 @@ def _query_current_project(
             if body is None:
                 logger.warning(
                     "current_project 查询读响应体失败(对端关闭或 %ss 超时),"
-                    "banner 省略项目提示",
-                    timeout,
+                    "banner 省略项目提示", timeout,
                 )
                 return None
             obj = json.loads(body.decode("utf-8"))
@@ -200,12 +185,56 @@ def _query_current_project(
 
     for line in output.splitlines():
         if line.startswith("VMCP_CURPROJ:"):
-            return line[len("VMCP_CURPROJ:") :].strip()
+            return line[len("VMCP_CURPROJ:"):].strip()
     logger.warning(
         "current_project 查询输出缺 VMCP_CURPROJ 标记,前 200 字: %r",
         output[:200],
     )
     return None
+
+
+def _cleanup_tmp_scripts_atexit() -> None:
+    """atexit 钩子:清理遗留的临时 Tcl 脚本。"""
+    for path in list(_TMP_SCRIPTS):
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+    _TMP_SCRIPTS.clear()
+
+
+atexit.register(_cleanup_tmp_scripts_atexit)
+
+
+def _locate_server_script() -> Path:
+    """定位打包进 wheel 的 vivado_mcp_server.tcl 文件。
+
+    优先级：
+    1. 与源码同级的 scripts/ 目录（editable 安装 / 源码运行）
+    2. 已安装的 wheel 内的 ``vivado_mcp/scripts/``（importlib.resources）
+    """
+    # 路径 1：仓库根的 scripts/（editable 模式）
+    here = Path(__file__).resolve().parent
+    # here = .../vivado_mcp/vivado/，上上级是仓库根
+    candidate = here.parent.parent.parent / "scripts" / "vivado_mcp_server.tcl"
+    if candidate.is_file():
+        return candidate
+
+    # 路径 2：package data（wheel 安装模式）
+    try:
+        with importlib.resources.as_file(
+            importlib.resources.files("vivado_mcp").joinpath(
+                "scripts/vivado_mcp_server.tcl"
+            )
+        ) as p:
+            if p.is_file():
+                return p
+    except (ModuleNotFoundError, FileNotFoundError, AttributeError):
+        pass
+
+    raise FileNotFoundError(
+        "找不到 vivado_mcp_server.tcl。请重新安装 vivado-mcp 或检查包完整性。"
+    )
 
 
 class GuiSession(BaseSession):
@@ -249,12 +278,12 @@ class GuiSession(BaseSession):
         # list_sessions 探活守卫据此跳过 fresh probe:Vivado 单线程 event loop
         # 正在跑已超时的长命令时,新连接得不到服务,1s 探活必然落空 ≠ 挂死。
         self._pending_response: bool = False
-        # P0 fix: stderr ring buffer + drain task (issue #6)
-        self._stderr_buffer: collections.deque[str] = collections.deque(maxlen=200)
-        self._stderr_task: asyncio.Task | None = None
-        # P2 fix: stdout ring buffer + drain task (issue #6)
-        self._stdout_buffer: collections.deque[str] = collections.deque(maxlen=200)
-        self._stdout_task: asyncio.Task | None = None
+        # B5 fix: stderr ring buffer + drain task
+        self._stderr_buffer = collections.deque(maxlen=200)
+        self._stderr_task = None
+        # P2 fix: stdout ring buffer + drain task
+        self._stdout_buffer = collections.deque(maxlen=200)
+        self._stdout_task = None
 
     @property
     def mode(self) -> str:
@@ -279,62 +308,117 @@ class GuiSession(BaseSession):
         """本 session spawn 的 vivado 进程 pid(attach / 外部命中路径为 None)。"""
         return self._pid
 
-    @property
-    def probe_port(self) -> int:
-        """TCP server 期望的端口号(probe / attach 路径用)。"""
-        return self._connected_port or self._port_preference or 9999
+    def status_dict(self) -> dict:
+        """在基类字段上补 pid,便于 list_sessions / 诊断区分自己 spawn 的实例。"""
+        d = super().status_dict()
+        if self._pid is not None:
+            d["pid"] = self._pid
+        return d
 
-    @property
-    def alive(self) -> bool:
-        return self._proc is not None and self._proc.returncode is None
+    @staticmethod
+    def _alloc_free_port() -> int:
+        """bind(("127.0.0.1", 0)) 抢一个 OS 分配的空闲端口号,立即释放后返回。
 
-    async def _handshake(self, reader, writer) -> bool:
-        """握手：发 ``puts VMCP_HANDSHAKE_ACK``,验响应 output 含 ACK + valid JSON。
-
-        仅握手完成才能进入 execute 主循环。失败时关连接抛错。
+        留一个极小的 TOCTOU 竞争窗口(取号→释放→tcl server 真正 bind 之间别的
+        进程可能抢走),但这是**可观测失败**:tcl server 绑不上会退出 + Python 连
+        该端口超时报错,不会像旧池逻辑那样静默串台连到别人的端口。
         """
-        import json as _json
-        import struct as _struct
-
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
-            ack_token = "VMCP_HANDSHAKE_ACK_" + uuid.uuid4().hex[:8]
-            payload = f"puts {ack_token}".encode("utf-8")
-            writer.write(len(payload).to_bytes(4, "big") + payload)
-            await writer.drain()
-            hdr = await reader.readexactly(4)
-            resp_len = _struct.unpack(">I", hdr)[0]
-            if resp_len <= 0 or resp_len > _HANDSHAKE_MAX_RESP:
-                return False
-            body = await reader.readexactly(resp_len)
-            obj = _json.loads(body.decode("utf-8"))
-            if not (isinstance(obj, dict) and "rc" in obj and "output" in obj):
-                return False
-            return ack_token in str(obj.get("output", ""))
-        except Exception:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind(("127.0.0.1", 0))
+            return s.getsockname()[1]
+        finally:
+            s.close()
+
+    @property
+    def is_alive(self) -> bool:
+        if self._state in (SessionState.DEAD, SessionState.STOPPED):
+            return False
+        if self._writer is None:
+            return False
+        # StreamWriter.is_closing() 反映 socket 状态
+        return not self._writer.is_closing()
+
+    async def _try_attach_existing(
+        self,
+        port: int,
+        timeout: float = 3.0,
+    ) -> bool:
+        """非 attach 模式下,试探 port 上是否已有 vivado-mcp server。
+
+        命中(连得上 + 握手通过)→ reader/writer/_connected_port 就绪,设
+        ``_attached_external=True``,返回 True。
+        失败 → 释放半开连接,返回 False。
+
+        修复 0.3.19 Bug:防止用户已装 init.tcl 且手动开了 GUI 时,MCP
+        spawn 一份新 Vivado,但 Python 端"先连上 9999 谁就赢"的逻辑
+        把客户端连到原 GUI,新 spawn 出来的进程变成孤儿。
+        """
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection("127.0.0.1", port),
+                timeout=timeout,
+            )
+        except (ConnectionRefusedError, asyncio.TimeoutError, OSError):
             return False
 
+        ok = await self._handshake(reader, writer)
+        if not ok:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+            return False
+
+        self._reader = reader
+        self._writer = writer
+        self._connected_port = port
+        self._attached_external = True
+        return True
+
     async def start(self, timeout: float = 120.0) -> str:
-        """启动 GUI 会话。
-
-        ``attach_only=False``:通过 cmd.exe 包装启动 ``vivado.bat``(loader.bat 会基于
-        ``PROCESSOR_ARCHITECTURE`` 自动检测 OS arch)。加载完成后 probe TCP server
-        等待握手,失败时调用 :meth:`_cleanup_failed_spawn` 避免孤儿进程。
-
-        ``attach_only=True``:假设外部 GUI 已启动且 init.tcl 注入了 TCP server,
-        MCP 直接连 port=``probe_port`` 即可。失败时不清理外部进程。
-
-        Returns:
-            启动横幅(版本 + current_project 提示)。
-        """
-        if self.alive:
-            return f"会话 '{self.session_id}' 已在运行中(mcp_is_alive=True)。"
+        """启动 Vivado GUI（或 attach 已有实例），建立 TCP 连接。"""
+        if self.is_alive:
+            return f"会话 '{self.session_id}' 已在运行中。"
 
         self._closing = False
         self._state = SessionState.STARTING
-        logger.info("启动 GUI 会话 '%s': %s", self.session_id, self.vivado_path)
+        logger.info(
+            "启动 GUI 会话 '%s' (attach=%s, port_pref=%d)",
+            self.session_id, self._attach_only, self._port_preference,
+        )
 
+        # ---- 0. 非 attach + 显式端口(port>0):先 probe,命中则直接 attach ----
+        # 避免和用户手动启动的 GUI 抢端口最后 spawn 出孤儿(0.3.19 Bug,§6 第1条)。
+        # port==0(未指定)= 明确要"独立新实例",**跳过 probe**,否则第2个实例会被
+        # attach 到第1个。两种意图都成立靠这个哨兵区分。
+        if not self._attach_only and self._port_preference > 0:
+            if await self._try_attach_existing(self._port_preference, timeout=3.0):
+                self._state = SessionState.READY
+                self._start_time = time.time()
+                msg = (
+                    f"GUI 会话就绪(attach 到现有 GUI):端口 "
+                    f"{self._connected_port}。"
+                    "检测到该端口已有 vivado-mcp server,跳过 spawn 直接接管。"
+                    "可能是你手动启动并装过 init.tcl 的 Vivado。"
+                    "stop_session 不会关闭这个 GUI。"
+                )
+                logger.info(
+                    "会话 '%s' attach 到外部 GUI(端口 %d),跳过 spawn",
+                    self.session_id, self._connected_port,
+                )
+                return msg + await self._current_project_hint()
+            logger.info(
+                "端口 %d 无 vivado-mcp server,走 spawn 新 GUI 路径",
+                self._port_preference,
+            )
+
+        # ---- 1. 如果非 attach 模式，spawn Vivado GUI(绑确切端口) ----
         if not self._attach_only:
-            # Determine target port and spawn vivado GUI
+            # 确定要注入给新 vivado 的**确切目标端口**:
+            #   port>0 → 用这个显式端口;port==0 → auto-alloc 一个空闲端口(独立实例)
             if self._port_preference > 0:
                 target_port = self._port_preference
             else:
@@ -342,8 +426,7 @@ class GuiSession(BaseSession):
                 target_port = self._allocated_port
                 logger.info(
                     "会话 '%s' 未指定端口,auto-alloc 空闲端口 %d 启动独立实例",
-                    self.session_id,
-                    target_port,
+                    self.session_id, target_port,
                 )
 
             try:
@@ -367,12 +450,9 @@ class GuiSession(BaseSession):
                 # atexit 兜底:MCP 进程被强杀时仍会清理
                 _TMP_SCRIPTS.add(tmp_script)
 
-                # D 方案(issue #6 P1 增强):Python 进程(包括 32-bit Python)收不到
-                # Windows 系统动态变量 PROCESSOR_ARCHITECTURE(实测:即使显式
-                # env={PROCESSOR_ARCHITECTURE: AMD64} 传给子进程,子 .bat 里
-                # %PROCESSOR_ARCHITECTURE% 仍是空)。但 cmd.exe 进程能读到。
-                # 改用 cmd.exe /c vivado.bat 让 cmd 解释器传递 PROC_ARCH,
-                # loader.bat 检测到 64-bit 走 win64 分支。实测有效。
+                # Windows 上显式通过 cmd.exe /c 调用 Vivado 的 .bat 入口。
+                # 本机 Vivado 2018.3 还需要配套修正 loader.bat 的架构默认值；
+                # cmd.exe 包装本身不保证 PROCESSOR_ARCHITECTURE 一定存在。
                 self._proc = await asyncio.create_subprocess_exec(
                     "cmd.exe", "/c", self.vivado_path,
                     "-mode", "gui",
@@ -385,12 +465,11 @@ class GuiSession(BaseSession):
                 # B5 + P2 fix: start stderr + stdout drain tasks
                 self._stderr_task = asyncio.create_task(self._drain_stderr())
                 self._stdout_task = asyncio.create_task(self._drain_stdout())
-                # 记下 pid:stop() 在 self._proc 引用丢失时仍能按 pid 精杀
+                # 记下 pid:stop() 在 self._proc 引用因故丢失时仍能按 pid 精杀
                 self._pid = self._proc.pid
                 logger.info(
                     "已 spawn Vivado GUI (pid=%s, 目标端口=%d), 等待 TCP server 就绪...",
-                    self._proc.pid,
-                    target_port,
+                    self._proc.pid, target_port,
                 )
             except (OSError, FileNotFoundError) as e:
                 self._state = SessionState.ERROR
@@ -412,7 +491,6 @@ class GuiSession(BaseSession):
         spawned = self._proc is not None
         if spawned:
             _PENDING_SPAWN_PORTS.add(target_port)
-
         try:
             deadline = time.time() + timeout
             connect_err: Exception | None = None
@@ -426,8 +504,8 @@ class GuiSession(BaseSession):
                     # 新 vivado 还没起完 → 等下一轮重试同一个确切端口
                     connect_err = e
                 else:
-                    # 连上后必须握手验证:确认对面说的是我们的 length-prefix 协议
-                    # (避免连到 SynthPilot 等其他产品的 server 上)
+                    # 连上后必须握手验证：确认对面说的是我们的 length-prefix 协议
+                    # （避免连到 SynthPilot 等其他产品的 server 上）
                     handshake_ok = await self._handshake(reader, writer)
                     if handshake_ok:
                         self._reader = reader
@@ -436,13 +514,13 @@ class GuiSession(BaseSession):
                         self._state = SessionState.READY
                         self._start_time = time.time()
                         msg = (
-                            f"GUI 会话就绪:attach={self._attach_only},"
-                            f" 端口 {target_port}"
+                            f"GUI 会话就绪：attach={self._attach_only}，"
+                            f"端口 {target_port}"
                         )
                         logger.info(msg)
                         return msg + await self._current_project_hint()
                     logger.debug(
-                        "端口 %d 握手失败(可能是其他产品的 server),重试",
+                        "端口 %d 握手失败（可能是其他产品的 server），重试",
                         target_port,
                     )
                     writer.close()
@@ -480,7 +558,7 @@ class GuiSession(BaseSession):
             if stdout_tail:
                 parts.append(f"\n--- stdout (recent 30 lines) ---\n{stdout_tail}")
             raise RuntimeError(
-                f"连接 Vivado GUI 超时({timeout}s,确切端口 {target_port})。"
+                f"连接 Vivado GUI 超时（{timeout}s，确切端口 {target_port}）。"
                 f"该端口可能被其他进程抢占,请重试。最后一次错误: {connect_err}"
                 + "".join(parts)
             )
@@ -519,8 +597,7 @@ class GuiSession(BaseSession):
         kill_pid = self._pid if self._pid is not None else self._proc.pid
         logger.warning(
             "会话 '%s' 启动失败,清理已 spawn 的 Vivado 进程 (pid=%s)",
-            self.session_id,
-            kill_pid,
+            self.session_id, kill_pid,
         )
         try:
             if sys.platform == "win32":
@@ -541,31 +618,9 @@ class GuiSession(BaseSession):
                 "清理 spawn 失败的 Vivado (pid=%s) 异常: %s", kill_pid, e
             )
 
-    async def _current_project_hint(self) -> str:
-        """启动横幅的项目状态提示(PRD A2)。
-
-        spawn 出来的全新 GUI / 用户停在 Start Page 的 GUI 没打开任何项目
-        (current_project 为空或 "New Project"),AI 直接跑 report_* 只会
-        拿到一串错。此时提示先 open_project。
-
-        查询走 :func:`_query_current_project` 的**一次性独立短连接**,主连接
-        零接触 —— 在主连接上 execute 查询一旦超时,迟到的响应会让后续所有命令
-        的结果永久错位(0.3.22 审计 P1)。查询失败不阻塞启动,降级为无提示
-        (helper 内已 log 具体原因)。同步收发包进 to_thread,不阻塞 event loop。
-        """
-        if self._connected_port is None:
-            return ""
-        proj = await asyncio.to_thread(
-            _query_current_project,
-            "127.0.0.1",
-            self._connected_port,
-        )
-        if not proj:
-            return ""
-        return f"\n提示: 当前 project={proj},如非预期请先 close_project -quiet 再 open_project <绝对路径>"
-
     async def _drain_stderr(self) -> None:
-        """后台任务:持续读取 Vivado stderr,存入环形缓冲区(issue #6 P0)。"""
+        """后台任务:持续读取 Vivado stderr,存入环形缓冲区(issue #6 P0)。
+        """
         assert self._proc and self._proc.stderr
         try:
             while True:
@@ -613,12 +668,195 @@ class GuiSession(BaseSession):
         lines = list(self._stdout_buffer)[-max_lines:]
         return "\n".join(lines)
 
+    async def _current_project_hint(self) -> str:
+        """启动横幅的项目状态提示(PRD A2)。
+
+        spawn 出来的全新 GUI / 用户停在 Start Page 的 GUI 没打开任何项目
+        (current_project 为空或 "New Project"),AI 直接跑 report_* 只会
+        拿到一串错。此时提示先 open_project。
+
+        查询走 :func:`_query_current_project` 的**一次性独立短连接**,主连接
+        零接触 —— 在主连接上 execute 查询一旦超时,残留响应会让后续所有命令
+        的结果永久错位(0.3.22 审计 P1)。查询失败不阻塞启动,降级为无提示
+        (helper 内已 log 具体原因)。同步收发包进 to_thread,不阻塞 event loop。
+        """
+        if self._connected_port is None:
+            return ""
+        proj = await asyncio.to_thread(
+            _query_current_project,
+            "127.0.0.1",
+            self._connected_port,
+            _CURPROJ_TIMEOUT,
+        )
+        if proj is None:
+            return ""
+        if proj in ("", "New Project"):
+            shown = proj if proj else "<无>"
+            return (
+                f"\n提示: 当前 project={shown},如非预期请先 "
+                "close_project -quiet 再 open_project <绝对路径>"
+            )
+        return ""
+
+    async def _handshake(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        timeout: float = 3.0,
+    ) -> bool:
+        """发送探测命令验证对端说的是我们的 length-prefix 协议。
+
+        与同步版 :func:`probe_vmcp_server` 共用同一份 token 生成 + 反射校验
+        (_make_probe_payload / _verify_probe_resp)。0.3.21 的 magic token
+        修复曾只打在 probe 这半边,_handshake 仍是弱校验(只验 rc/output
+        字段存在),VMware vNIC 类假阳性 listener 在 attach 路径上仍能骗过
+        —— 本次归一,杜绝逻辑 fork。
+
+        成功:JSON 响应是 dict、含 rc/output 字段,且 output 反射了本次 token
+        失败:超时 / 长度头异常大 / JSON 解析失败 / token 未反射
+        → 说明对面可能是 SynthPilot / VMware vNIC 等其他服务
+        """
+        token, payload = _make_probe_payload()
+        header = len(payload).to_bytes(4, "big")
+        try:
+            writer.write(header + payload)
+            await writer.drain()
+
+            # 读 4 字节响应头
+            resp_hdr = await asyncio.wait_for(
+                reader.readexactly(4), timeout=timeout
+            )
+            resp_len = int.from_bytes(resp_hdr, "big")
+            # 合理响应通常 <1KB；超过这值大概率是把 ASCII 当长度解释的
+            if resp_len <= 0 or resp_len > _HANDSHAKE_MAX_RESP:
+                return False
+
+            body = await asyncio.wait_for(
+                reader.readexactly(resp_len), timeout=timeout
+            )
+            obj = json.loads(body.decode("utf-8"))
+            return _verify_probe_resp(obj, token)
+        except Exception:
+            return False
+
+    async def execute(
+        self,
+        tcl_command: str,
+        timeout: float = 120.0,
+    ) -> TclResult:
+        """发送 Tcl 命令并等待响应。"""
+        if self._closing or not self.is_alive:
+            raise RuntimeError(
+                f"会话 '{self.session_id}' 正在关闭或未连接。请先调用 start_session。"
+            )
+
+        assert self._reader and self._writer
+
+        async with self._lock:
+            if self._closing:
+                raise RuntimeError(f"会话 '{self.session_id}' 正在关闭，拒绝执行新命令。")
+            if self._inflight_task is not None and not self._inflight_task.done():
+                raise RuntimeError(
+                    f"会话 '{self.session_id}' 的上一条命令仍在执行。"
+                    "请稍后重试；不会向同一 Vivado 会话并发发送新命令。"
+                )
+
+            self._state = SessionState.BUSY
+            task = asyncio.create_task(self._execute_impl(tcl_command))
+            self._inflight_task = task
+            task.add_done_callback(self._on_inflight_done)
+            try:
+                result = await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
+                self._state = SessionState.READY
+                return result
+            except asyncio.TimeoutError:
+                # 读任务继续独占这一帧；完成前下一次 execute 会被上面的守卫拒绝。
+                self._pending_response = True
+                self._state = SessionState.BUSY
+                phase = (
+                    "读取响应体超时"
+                    if self._response_phase == "body"
+                    else "读取响应长度头超时"
+                )
+                raise asyncio.TimeoutError(
+                    f"{phase}（{timeout}s）。命令: {tcl_command[:200]}"
+                ) from None
+            except (ConnectionError, asyncio.IncompleteReadError) as e:
+                # D4: 连接断开，标记为 DEAD，不自动重连
+                self._state = SessionState.DEAD
+                raise RuntimeError(
+                    f"GUI 会话连接断开（Vivado 可能被关闭或崩溃）: {e}。"
+                    "请重新调用 start_session。"
+                ) from e
+            except Exception:
+                if self.is_alive:
+                    self._state = SessionState.READY
+                else:
+                    self._state = SessionState.DEAD
+                raise
+
+    def _on_inflight_done(self, task: asyncio.Task[TclResult]) -> None:
+        """收尾迟到响应，并保证同一连接始终只有一个 reader。"""
+        try:
+            exc = task.exception()
+            if exc is not None:
+                logger.debug("[%s] 在途命令结束时异常: %s", self.session_id, exc)
+        except asyncio.CancelledError:
+            pass
+
+        if self._inflight_task is task:
+            self._inflight_task = None
+            self._pending_response = False
+            self._response_phase = None
+            if self._state == SessionState.BUSY:
+                self._state = SessionState.READY if self.is_alive else SessionState.DEAD
+
+    async def _execute_impl(
+        self,
+        tcl_command: str,
+    ) -> TclResult:
+        assert self._reader and self._writer
+
+        # 发送：[4 字节长度][UTF-8 payload]
+        payload = tcl_command.encode("utf-8")
+        header = len(payload).to_bytes(4, "big")
+        self._writer.write(header + payload)
+        await self._writer.drain()
+
+        # 接收：[4 字节长度][UTF-8 JSON payload]
+        self._response_phase = "header"
+        resp_hdr = await self._reader.readexactly(4)
+
+        resp_len = int.from_bytes(resp_hdr, "big")
+        if resp_len < 0 or resp_len > _MAX_RESPONSE_BYTES:
+            raise RuntimeError(
+                f"非法响应长度 {resp_len}（限 {_MAX_RESPONSE_BYTES} 字节以内）。"
+            )
+
+        self._response_phase = "body"
+        resp_body = await self._reader.readexactly(resp_len)
+        try:
+            obj = json.loads(resp_body.decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            raise RuntimeError(
+                f"响应 JSON 解析失败: {e}。原始响应前 200 字节: "
+                f"{resp_body[:200]!r}"
+            ) from e
+
+        rc = int(obj.get("rc", -1))
+        output = clean_output(str(obj.get("output", "")))
+        return TclResult(
+            output=output,
+            return_code=rc,
+            is_error=(rc != 0),
+        )
+
     async def stop(self, timeout: float = 10.0) -> None:
         """关闭 TCP 连接 + 终止 spawn 的 GUI 进程（attach 模式不终止外部进程）。
 
         B13 修复:原 ``_proc.terminate()`` 只杀 ``vivado.bat`` 的 cmd.exe 外壳,
         Windows 没有进程组概念,子进程 vivado.exe 会变成孤儿继续占 800MB+ 内存,
-        且 Vivado自己写的 ``vivado_pid<PID>.str`` 文件不被清理。
+        且 Vivado 自己写的 ``vivado_pid<PID>.str`` 文件不被清理。
 
         新策略:
         1. 先通过 TCP 发 Tcl ``exit`` 让 Vivado 优雅退出(会自动清 pid 文件)
@@ -634,7 +872,7 @@ class GuiSession(BaseSession):
         self._state = SessionState.STOPPING
         logger.info("正在关闭 GUI 会话 '%s'...", self.session_id)
 
-        # B5 + P2 fix: cancel stderr + stdout drain tasks (issue #6 P2)
+        # B5 + P2 fix: cancel stderr + stdout drain tasks
         if self._stderr_task is not None and not self._stderr_task.done():
             self._stderr_task.cancel()
             try:
@@ -650,7 +888,7 @@ class GuiSession(BaseSession):
                 pass
             self._stdout_task = None
 
-        # 步骤 1:尝试优雅退出 —— 发 Tcl `exit`,Vivado自己清 pid/journal
+        # 步骤 1:尝试优雅退出 —— 发 Tcl `exit`,Vivado 自己清 pid/journal
         # attach 模式 OR probe-then-attach 命中外部 GUI 时,都是用户的 Vivado,不主动 exit
         inflight = self._inflight_task
         if inflight is None or inflight.done():
@@ -717,8 +955,7 @@ class GuiSession(BaseSession):
                     except asyncio.TimeoutError:
                         logger.warning(
                             "Vivado 进程 PID=%s 未在 %ss 内退出,可能成为孤儿进程",
-                            kill_pid,
-                            timeout,
+                            kill_pid, timeout,
                         )
                     except Exception as e:
                         logger.warning("强杀 Vivado 进程异常: %s", e)
@@ -756,3 +993,4 @@ class GuiSession(BaseSession):
         self._response_phase = None
         self._closing = False
         logger.info("GUI 会话 '%s' 已关闭。", self.session_id)
+
