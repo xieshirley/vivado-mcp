@@ -179,16 +179,6 @@ run_tcl(session_id="verify_gui", command="version -short")
 
 预期看到 GUI 窗口、会话 ready，以及版本号 `2018.3`。Tcl 命令是 `version -short`，不是 `version -shot`。
 
-随后通过同一会话的 `run_tcl` 执行：
-
-```tcl
-open_project {D:/zynq7100/RX/DSSS_RX_914/NO428_RX/DSSS_RX.xpr}
-get_property NAME [current_project]
-get_property PART [current_project]
-```
-
-历史结果为工程 `DSSS_RX`、器件 `xc7z100ffg900-2`。其他设备需替换工程路径，且本文不包含该工程。
-
 只关闭工程、保留 Vivado 窗口时，在同一会话执行：
 
 ```tcl
